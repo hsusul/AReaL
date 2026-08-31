@@ -1217,15 +1217,15 @@ class RolloutControllerV2:
         drop_incomplete_group: bool = False,
     ) -> int:
         self._ensure_initialized()
-        if reward_normalization or drop_incomplete_group:
+        if drop_incomplete_group:
             raise ValueError(
-                "RolloutControllerV2 does not support reward_normalization or "
-                "drop_incomplete_group yet."
+                "RolloutControllerV2 does not support drop_incomplete_group yet."
             )
         resolved_workflow = self._resolve_workflow(
             workflow,
             workflow_kwargs,
             group_size,
+            reward_normalization,
         )
         resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         return self.workflow_executor.submit(
@@ -1301,10 +1301,9 @@ class RolloutControllerV2:
             A list of trajectory dicts (one per completed rollout).
         """
         self._ensure_initialized()
-        if reward_normalization or drop_incomplete_group:
+        if drop_incomplete_group:
             raise ValueError(
-                "RolloutControllerV2 does not support reward_normalization or "
-                "drop_incomplete_group yet."
+                "RolloutControllerV2 does not support drop_incomplete_group yet."
             )
         if not self._gateway_addr:
             raise RuntimeError("RolloutControllerV2.initialize() must be called first")
@@ -1322,6 +1321,7 @@ class RolloutControllerV2:
             workflow,
             workflow_kwargs,
             group_size,
+            reward_normalization,
         )
         resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         for item in data:
@@ -1378,10 +1378,9 @@ class RolloutControllerV2:
             A list of trajectory dicts (matching ``RolloutController`` API).
         """
         self._ensure_initialized()
-        if reward_normalization or drop_incomplete_group:
+        if drop_incomplete_group:
             raise ValueError(
-                "RolloutControllerV2 does not support reward_normalization or "
-                "drop_incomplete_group yet."
+                "RolloutControllerV2 does not support drop_incomplete_group yet."
             )
         if not self._gateway_addr:
             raise RuntimeError("RolloutControllerV2.initialize() must be called first")
@@ -1396,6 +1395,7 @@ class RolloutControllerV2:
             workflow,
             workflow_kwargs,
             group_size,
+            reward_normalization,
         )
         resolved_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         results = self.workflow_executor.prepare_batch(
@@ -1683,7 +1683,12 @@ class RolloutControllerV2:
 
     # -- Workflow resolution helpers ----------------------------------------
 
-    def _wrap_agent(self, agent: Any, group_size: int = 1):
+    def _wrap_agent(
+        self,
+        agent: Any,
+        group_size: int = 1,
+        reward_normalization: bool = False,
+    ):
         """Wrap an agent in an InferenceServiceWorkflow.
 
         Parameters
@@ -1692,6 +1697,8 @@ class RolloutControllerV2:
             The agent to wrap (any object with an async ``run()`` method).
         group_size : int
             Number of parallel trajectories per episode.
+        reward_normalization : bool
+            Normalize rewards across the episode's trajectory group before export.
         """
         from areal.v2.inference_service.controller.workflow import (
             InferenceServiceWorkflow,
@@ -1717,6 +1724,7 @@ class RolloutControllerV2:
             group_size=group_size,
             serialize_group_samples=self.config.serialize_group_samples,
             drop_retry_orphans=agent_cfg.drop_retry_orphans,
+            reward_normalization=reward_normalization,
         )
 
     def _resolve_workflow(
@@ -1724,6 +1732,7 @@ class RolloutControllerV2:
         workflow,
         workflow_kwargs=None,
         group_size=1,
+        reward_normalization=False,
     ):
         """Resolve a workflow-like input to an InferenceServiceWorkflow.
 
@@ -1740,6 +1749,8 @@ class RolloutControllerV2:
             Keyword arguments passed to the agent constructor.
         group_size : int
             Number of times to run the workflow per input.
+        reward_normalization : bool
+            Normalize rewards across each offline agent trajectory group.
         """
         from areal.api.workflow_api import RolloutWorkflow
         from areal.utils.dynamic_import import import_from_string
@@ -1759,6 +1770,10 @@ class RolloutControllerV2:
 
         # (a) None → online mode: create InferenceServiceWorkflow without agent
         if workflow is None:
+            if reward_normalization:
+                raise ValueError(
+                    "Online mode (workflow=None) does not support reward_normalization."
+                )
             if group_size > 1:
                 raise ValueError(
                     "Online mode (workflow=None) does not support group_size > 1. "
@@ -1812,7 +1827,11 @@ class RolloutControllerV2:
             )
 
         # (d) Wrap the agent in InferenceServiceWorkflow (with group_size)
-        resolved = self._wrap_agent(agent, group_size=group_size)
+        resolved = self._wrap_agent(
+            agent,
+            group_size=group_size,
+            reward_normalization=reward_normalization,
+        )
 
         return resolved
 

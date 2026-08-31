@@ -54,6 +54,7 @@ from areal.trainer.mopd.teacher_manager import (
 )
 from areal.trainer.mopd.teacher_phase import MOPDTeacherPhase
 from areal.utils import logging, perf_tracer, seeding, stats_tracker
+from areal.utils.cleanup import run_batch_cleanups
 from areal.utils.dataloader import create_dataloader
 from areal.utils.dte import apply_dte_config_envvars
 from areal.utils.environ import is_single_controller
@@ -747,6 +748,16 @@ class PPOTrainer:
         elif self._requires_proxy_workflow(workflow):
             self._ensure_proxy_started()
 
+        if self.recover_info is None and self._evaluate_before_train(
+            eval_workflow=eval_workflow,
+            eval_workflow_kwargs=eval_workflow_kwargs,
+        ):
+            self._export_and_commit_stats(
+                epoch=-1,
+                epoch_step=-1,
+                global_step=-1,
+            )
+
         for global_step in range(start_step, max_steps):
             if (
                 config.total_train_steps is not None
@@ -1053,13 +1064,30 @@ class PPOTrainer:
                 # SPMD mode never populates ``_fetch_buffer`` (no RTensor
                 # round-trip), so the fan-out is single-controller only.
                 if is_single_controller():
-                    self.actor.clear_batches(rollout_batch, adv_batch)
+                    cleanups = [
+                        (
+                            "actor",
+                            lambda: self.actor.clear_batches(rollout_batch, adv_batch),
+                        )
+                    ]
                     if self.critic is not None:
-                        self.critic.clear_batches(rollout_batch, adv_batch)
+                        cleanups.append(
+                            (
+                                "critic",
+                                lambda: self.critic.clear_batches(
+                                    rollout_batch, adv_batch
+                                ),
+                            )
+                        )
                     if self.ref is not None:
-                        self.ref.clear_batches(rollout_batch)
+                        cleanups.append(
+                            ("ref", lambda: self.ref.clear_batches(rollout_batch))
+                        )
                     if self.data_controller is not None:
-                        self.data_controller.clear_batches()
+                        cleanups.append(
+                            ("data", lambda: self.data_controller.clear_batches())
+                        )
+                    run_batch_cleanups(cleanups)
 
             with perf_tracer.trace_scope(
                 "train.log_stats",
@@ -1635,6 +1663,44 @@ class PPOTrainer:
         if not is_single_controller():
             dist.barrier(group=self.actor.cpu_group)
             current_platform.synchronize()
+
+    def _evaluate_before_train(
+        self,
+        eval_workflow: WorkflowLike | None,
+        eval_workflow_kwargs,
+    ) -> bool:
+        if (
+            self.eval_rollout is None
+            or self.valid_dataloader is None
+            or eval_workflow is None
+        ):
+            return self.evaluator.evaluate_before_train(None)
+
+        def evaluate_fn() -> None:
+            if self._should_offload_rollout:
+                self._onload_rollout(is_eval=True)
+            try:
+                with (
+                    stats_tracker.record_timing("eval"),
+                    perf_tracer.trace_scope(
+                        "train.eval",
+                        category=Category.COMPUTE,
+                        args={"global_step": -1},
+                    ),
+                ):
+                    self._evaluate_fn(
+                        eval_workflow=eval_workflow,
+                        eval_workflow_kwargs=eval_workflow_kwargs,
+                    )
+            finally:
+                if self._should_offload_rollout:
+                    self._offload_rollout(is_eval=True)
+
+        evaluated = self.evaluator.evaluate_before_train(evaluate_fn)
+        if evaluated and not is_single_controller():
+            dist.barrier(group=self.actor.cpu_group)
+            current_platform.synchronize()
+        return evaluated
 
     def _evaluate(
         self,

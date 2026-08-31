@@ -396,6 +396,15 @@ class SGLangBackend:
 
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
         """Launch SGLang server subprocess."""
+        if server_args.get("enable_multimodal") and not server_args.get(
+            "skip_tokenizer_init", False
+        ):
+            logger.warning(
+                "SGLang multimodal rollout is running with "
+                "skip_tokenizer_init=False. Requests that send processor-expanded "
+                "input IDs together with image data may be processed again by the "
+                "server. Set skip_tokenizer_init=True for VLM rollout recipes."
+            )
         awex_meta_addr = server_args.pop(
             "awex_meta_server_addr", None
         ) or os.environ.get("AWEX_META_SERVER_ADDR")

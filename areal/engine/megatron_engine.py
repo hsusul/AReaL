@@ -81,6 +81,7 @@ from areal.engine.megatron_utils.packed_context_parallel import (
     _is_multi_modal_payload_key,
     extract_vision_from_multi_modal,
     packed_context_parallel_forward,
+    prepare_microbatches_for_sequence_layout,
     reassemble_cp_packed_logprobs,
     split_packed_seqs_for_context_parallel,
 )
@@ -127,9 +128,9 @@ from areal.utils.data import (
     broadcast_tensor,
     concat_batch,
     pack_tensor_dict,
-    pad_mb_list,
     split_batch,
     split_padded_tensor_dict_into_mb_list,
+    tensor_container_to,
     unpad_logits,
 )
 from areal.utils.functional import gather_logprobs, gather_logprobs_entropy
@@ -314,6 +315,27 @@ class _MegatronModelList(list):
 
 
 class MegatronEngine(TrainEngine):
+    # Trainers use this capability flag to release RPC/full-batch GPU payloads
+    # before constructing optimizer microbatches.
+    stream_microbatches_from_cpu = True
+    cpu_staged_rpc_methods = frozenset(
+        {
+            "compute_logp",
+            "compute_values",
+            "eval_batch",
+            "evaluate_dpo",
+            "evaluate_lm",
+            "evaluate_rw",
+            "forward",
+            "forward_batch",
+            "ppo_update",
+            "train_batch",
+            "train_dpo",
+            "train_lm",
+            "train_rw",
+        }
+    )
+
     def __init__(self, config: TrainEngineConfig):
         self.config = config
         self.hf_config: PretrainedConfig
@@ -349,6 +371,7 @@ class MegatronEngine(TrainEngine):
         self._weight_residency: MegatronWeightResidency | None = None
         self._awex_publisher: AwexWeightPublisher | None = None
         self._dte_runtime_config = DTERuntimeConfig.from_env()
+        self._warned_unbounded_microbatch = False
         self.enable_tree_training: bool = self.config.enable_tree_training
         _validate_areal_lm_head_compatibility(
             self.mcore_config.enable_chunked_logits,
@@ -1132,7 +1155,14 @@ class MegatronEngine(TrainEngine):
         self._ensure_ready()
 
         def forward_step(batch_iter, model):
-            mb_input: MicroBatchItem = next(batch_iter)
+            source_mb: MicroBatchItem = next(batch_iter)
+            # Keep MicroBatchList CPU-only. The returned accelerator dictionaries
+            # are owned solely by this forward step and cannot accumulate in the
+            # source list as the schedule consumes more microbatches.
+            mb_input = source_mb.to(
+                self.device,
+                non_blocking=True,
+            )
 
             cu_seqlens = mb_input.padded_mb.get("cu_seqlens", None)
 
@@ -1349,7 +1379,7 @@ class MegatronEngine(TrainEngine):
         input_batched, _ = self._normalize_batch_input(input_)
 
         # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        mb_list = self._prepare_mb_list(tensor_container_to(input_batched, "cpu"))
 
         # Step 2: Compute total loss weight.
         # Use DP+CP group: after CP all-gather each rank computes the full-sequence
@@ -1360,6 +1390,7 @@ class MegatronEngine(TrainEngine):
             mb_list,
             loss_weight_fn,
             mpu.get_data_parallel_group(with_context_parallel=True),
+            device=self.device,
         )
 
         # Step 3: Forward-backward using Megatron's pipeline function.
@@ -1410,13 +1441,14 @@ class MegatronEngine(TrainEngine):
         input_batched, _ = self._normalize_batch_input(input_)
 
         # Step 1: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        mb_list = self._prepare_mb_list(tensor_container_to(input_batched, "cpu"))
 
         # Step 2: Compute total loss weight (DP+CP, see train_batch comment).
         total_loss_weight = compute_total_loss_weight(
             mb_list,
             loss_weight_fn,
             mpu.get_data_parallel_group(with_context_parallel=True),
+            device=self.device,
         )
 
         # Step 3: Forward using Megatron's pipeline function, collecting losses
@@ -1462,14 +1494,18 @@ class MegatronEngine(TrainEngine):
                     f"inferred {inferred_seqlens} from attention_mask shapes."
                 )
             output_seqlens = inferred_seqlens
-        cu_seqlens = pack_tensor_dict(input_batched)["cu_seqlens"]
         if output_seqlens is None:
-            output_seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).cpu().numpy().tolist()
+            output_seqlens = (
+                input_batched["attention_mask"]
+                .sum(dim=1, dtype=torch.int64)
+                .cpu()
+                .tolist()
+            )
         assert output_seqlens is not None
         batch_size = len(output_seqlens)
 
         # Step 2: Prepare micro-batches
-        mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        mb_list = self._prepare_mb_list(tensor_container_to(input_batched, "cpu"))
 
         # Step 3: Forward using Megatron's pipeline function, collecting results
         outputs: list[torch.Tensor] = []
@@ -1818,12 +1854,9 @@ class MegatronEngine(TrainEngine):
             )
             if dp_rank == mpu.get_data_parallel_rank():
                 self._context_and_model_parallel_group = group
-        # The gloo mirror is only read once an offloaded engine has handed the
-        # accelerator to rollout and device collectives are unusable (see
-        # resolve_broadcast_target). Building it otherwise costs one collective
-        # per data-parallel group at startup for a group nothing ever uses;
-        # resolve_broadcast_target falls back to the device group when it is None.
-        if self.config.offload:
+        # Offloaded engines and CPU-staged streaming RPCs cannot use accelerator
+        # collectives for payload distribution, so both require a gloo mirror.
+        if self.config.offload or self.stream_microbatches_from_cpu:
             for dp_rank, ranks in enumerate(context_and_model_parallel_ranks):
                 cpu_group = dist.new_group(
                     ranks, timeout=DIST_GROUP_DEFAULT_TIMEOUT, backend="gloo"
@@ -2727,6 +2760,9 @@ class MegatronEngine(TrainEngine):
                     f"Number of tree micro-batches ({len(mb_list)}) is less than recommended"
                     f" minimum ({recommended_min_n_mbs}) to avoid pipeline bubbles."
                 )
+            # The schedule only consumes mbs/padded_mbs and metadata. Releasing
+            # the original dense batch avoids retaining a third CPU copy.
+            mb_list.data = {}
             return mb_list
         # Amend position ids (skip for VLM — model computes mRoPE internally)
         if not self.is_vision_model:
@@ -2737,6 +2773,15 @@ class MegatronEngine(TrainEngine):
         min_n_mbs = (
             2 * pp_size if pp_size > 1 else 1
         )  # avoid pipeline bubbles in training
+        if self.config.mb_spec.max_tokens_per_mb is None and not getattr(
+            self, "_warned_unbounded_microbatch", False
+        ):
+            self.logger.warning(
+                "Megatron CPU streaming bounds full-batch input residency, but "
+                "mb_spec.max_tokens_per_mb is unset. A growing batch can still "
+                "form a growing microbatch and increase activation memory."
+            )
+            self._warned_unbounded_microbatch = True
         # NOTE: self.config.mb_spec.max_tokens_per_mb determines
         # the expected **total** number of tokens per micro-batch **in the forward pass**.
         # The micro batch list splitted here will be splitted to each
@@ -2753,20 +2798,21 @@ class MegatronEngine(TrainEngine):
             group=mpu.get_data_parallel_group(),
         )
         mb_list.mbs = [pack_tensor_dict(mb) for mb in mb_list.mbs]
-        # NOTE: Pad micro-batches to:
-        # 1. Reduce GPU memory fragmentation, pad actual # tokens per mb to integer multiples
-        #  of GPU page size or max_tokens_per_mb
-        # 2. Align sequence lengths to integer multiples of `align_to_multiple_of=tp_size*cp_size*2`
-        #    to satisfy the requirement of Megatron parallelism.
+        # Project each micro-batch to the model's sequence layout. Wrapper-owned
+        # THD can use a trailing padding segment to reduce memory fragmentation;
+        # The default BSHD/model-owned THD path cannot, because reconstruction
+        # would turn that segment into a synthetic batch row. Every layout
+        # still aligns each real sequence for Megatron parallelism.
         align_to_multiple_of = tp_size * cp_size * 2 if cp_size > 1 else tp_size
         align_to_multiple_of = (
             math.lcm(align_to_multiple_of, DEFAULT_VECTORIZED_ALIGNMENT_BYTES)
             if self.enable_fp8
             else align_to_multiple_of
         )
-        mb_list = pad_mb_list(
+        assert self.sequence_packing_mode is not None
+        mb_list = prepare_microbatches_for_sequence_layout(
             mb_list,
-            pad_value=0.0,
+            sequence_packing_mode=self.sequence_packing_mode,
             pad_to_maximum=self.config.pad_to_maximum,
             seq_align_to=align_to_multiple_of,
         )
@@ -2800,6 +2846,10 @@ class MegatronEngine(TrainEngine):
                 for k, v in mb_list.data.items()
                 if not _is_multi_modal_payload_key(k)
             }
+
+        # No Megatron schedule or output reordering path consumes the original
+        # dense batch after packing. Keep only the CPU microbatch sources.
+        mb_list.data = {}
 
         return mb_list
 

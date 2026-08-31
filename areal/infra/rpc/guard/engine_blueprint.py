@@ -90,17 +90,37 @@ def _should_broadcast_payload(
 
 
 def resolve_broadcast_target(
-    engine: TrainEngine | InferenceEngine, device: Any
+    engine: TrainEngine | InferenceEngine,
+    device: Any,
+    method_name: str | None = None,
 ) -> tuple[Any, Any]:
     """Offloaded engines gave the accelerator to the inference engine, so device
     collectives are unusable and a gloo mirror is used. The mirror must span the
     ranks of ``context_and_model_parallel_group`` or the broadcast deadlocks;
     engines without one keep the pre-offload device broadcast.
     """
+    cpu_staged = method_name is not None and _should_stage_rpc_payload_on_cpu(
+        engine, method_name
+    )
     cpu_mirror_group = getattr(engine, "cpu_model_parallel_group", None)
+    if cpu_staged:
+        if cpu_mirror_group is None:
+            raise RuntimeError(
+                "Broadcast required for CPU-staged method, but "
+                "engine.cpu_model_parallel_group is None"
+            )
+        return cpu_mirror_group, "cpu"
     if getattr(engine, "is_offload", False) and cpu_mirror_group is not None:
         return cpu_mirror_group, "cpu"
     return engine.context_and_model_parallel_group, device
+
+
+def _should_stage_rpc_payload_on_cpu(
+    engine: TrainEngine | InferenceEngine, method_name: str
+) -> bool:
+    """Whether an engine method consumes a CPU-staged RPC payload."""
+    methods = getattr(engine, "cpu_staged_rpc_methods", ())
+    return method_name in methods
 
 
 engine_bp = Blueprint("engine", __name__)
@@ -486,7 +506,7 @@ def call_engine_method():
                 if should_broadcast:
                     logger.debug(f"Broadcasting RPC payload for method: {method_name}")
                     bcast_group, bcast_device = resolve_broadcast_target(
-                        engine, current_platform.current_device()
+                        engine, current_platform.current_device(), method_name
                     )
                     args_bcast = tensor_container_to(args, bcast_device)
                     args_bcast = broadcast_tensor_container(
