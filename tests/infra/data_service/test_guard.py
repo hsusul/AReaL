@@ -20,7 +20,9 @@ def state() -> GuardState:
     s.trial_name = "test-trial"
     s.role = "test-role"
     s.worker_index = 0
-    return s
+    yield s
+    for lock_file in s.port_lock_files.values():
+        lock_file.close()
 
 
 @pytest.fixture()
@@ -74,6 +76,73 @@ def test_owned_ports_release_after_failed_fork(mock_find, client, state: GuardSt
     assert ("worker", 2) not in state.owned_ports
 
 
+@patch("areal.infra.rpc.guard.app.find_free_ports")
+def test_alloc_ports_duplicate_owner_returns_conflict(
+    mock_find, client, state: GuardState
+):
+    mock_find.return_value = [9011]
+    payload = {"count": 1, "role": "worker", "worker_index": 3}
+
+    first = client.post("/alloc_ports", json=payload)
+    second = client.post("/alloc_ports", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert state.owned_ports[("worker", 3)] == {9011}
+
+
+def test_release_ports_running_child_returns_conflict(client, state: GuardState):
+    mock_proc = _make_mock_process(pid=41)
+    state.forked_children_map[("worker", 4)] = mock_proc
+    state.owned_ports[("worker", 4)] = {9012}
+    state.allocated_ports.add(9012)
+
+    response = client.post("/release_ports", json={"role": "worker", "worker_index": 4})
+
+    assert response.status_code == 409
+    assert state.owned_ports[("worker", 4)] == {9012}
+    assert state.allocated_ports == {9012}
+
+
+@patch("areal.infra.rpc.guard.app.run_with_streaming_logs")
+def test_fork_without_port_reservation_returns_conflict(
+    mock_run, client, state: GuardState
+):
+    response = client.post(
+        "/fork",
+        json={
+            "role": "worker",
+            "worker_index": 5,
+            "raw_cmd": ["python", "-m", "module"],
+        },
+    )
+
+    assert response.status_code == 409
+    mock_run.assert_not_called()
+
+
+@patch(
+    "areal.infra.rpc.guard.app.run_with_streaming_logs",
+    side_effect=RuntimeError("spawn failed"),
+)
+def test_fork_spawn_failure_releases_owned_ports(mock_run, client, state: GuardState):
+    state.owned_ports[("worker", 6)] = {9013}
+    state.allocated_ports.add(9013)
+
+    response = client.post(
+        "/fork",
+        json={
+            "role": "worker",
+            "worker_index": 6,
+            "raw_cmd": ["python", "-m", "module", "--port", "9013"],
+        },
+    )
+
+    assert response.status_code == 500
+    assert ("worker", 6) not in state.owned_ports
+    assert 9013 not in state.allocated_ports
+
+
 @patch("areal.infra.rpc.guard.app.run_with_streaming_logs")
 def test_fork_raw_command_success(mock_run, client, state: GuardState):
     mock_proc = _make_mock_process(pid=42)
@@ -102,10 +171,15 @@ def test_kill_known_worker(mock_kill, client, state: GuardState):
     mock_proc = _make_mock_process(pid=123)
     state.forked_children.append(mock_proc)
     state.forked_children_map[("test", 0)] = mock_proc
+    state.owned_ports[("test", 0)] = {9014}
+    state.allocated_ports.add(9014)
 
     resp = client.post("/kill_forked_worker", json={"role": "test", "worker_index": 0})
     assert resp.status_code == 200
+    assert resp.get_json()["released_ports"] == [9014]
     assert ("test", 0) not in state.forked_children_map
+    assert ("test", 0) not in state.owned_ports
+    assert 9014 not in state.allocated_ports
     mock_kill.assert_called_once_with(123, timeout=3, graceful=True)
 
 
